@@ -6,8 +6,11 @@ This module contains the transport adapters that Requests uses to define
 and maintain connections.
 """
 
+import io
 import os.path
 import socket  # noqa: F401
+
+from __splootcode_internal import sync_fetch
 
 from urllib3.exceptions import ClosedPoolError, ConnectTimeoutError
 from urllib3.exceptions import HTTPError as _HTTPError
@@ -26,6 +29,8 @@ from urllib3.response import HTTPResponse
 from urllib3.util import Timeout as TimeoutSauce
 from urllib3.util import parse_url
 from urllib3.util.retry import Retry
+
+from http.client import HTTPResponse as InternalHTTPResponse
 
 from .auth import _basic_auth_str
 from .compat import basestring, urlparse
@@ -67,6 +72,11 @@ DEFAULT_POOLSIZE = 10
 DEFAULT_RETRIES = 0
 DEFAULT_POOL_TIMEOUT = None
 
+class _FakeSock:
+    def __init__(self, fp):
+        self.fp = fp
+    def makefile(self, *args, **kwargs):
+        return self.fp
 
 class BaseAdapter:
     """The Base Transport Adapter"""
@@ -485,63 +495,99 @@ class HTTPAdapter(BaseAdapter):
             timeout = TimeoutSauce(connect=timeout, read=timeout)
 
         try:
-            if not chunked:
-                resp = conn.urlopen(
-                    method=request.method,
-                    url=url,
-                    body=request.body,
-                    headers=request.headers,
-                    redirect=False,
-                    assert_same_host=False,
-                    preload_content=False,
-                    decode_content=False,
-                    retries=self.max_retries,
-                    timeout=timeout,
-                )
+            fetch_response = sync_fetch(
+                request.method,
+                request.url,
+                # Must convert to dict because JS doesn't understand CaseInsensitiveDict
+                dict(request.headers.items()),
+                request.body
+            )
+            fetch_response = fetch_response.to_py()
 
-            # Send the request.
-            else:
-                if hasattr(conn, "proxy_pool"):
-                    conn = conn.proxy_pool
+            body_bytes = io.BytesIO(fetch_response['body'])
+            resp = HTTPResponse(
+                status=fetch_response['status'],
+                reason=fetch_response['reason'],
+                version=11,
+                body=io.BufferedReader(body_bytes),
+                request_method=request.method,
+                request_url=url,
+                preload_content=False,
+                headers=CaseInsensitiveDict(**fetch_response['headers'])
+            )
 
-                low_conn = conn._get_conn(timeout=DEFAULT_POOL_TIMEOUT)
+            # Alternative implementation: From a raw HTTP request:
+            # data = io.BytesIO(b'HTTP/1.1 200 OK\nContent-Length: 17\nContent-Type: text/html\n\nHello this is dog')
+            # sock = _FakeSock(io.BufferedReader(data))
+            # resp = InternalHTTPResponse(sock, method='GET', url='http://python.org/')
+            # resp.begin()
+            # resp = HTTPResponse.from_httplib(
+            #     resp,
+            #     request_method=request.method,
+            #     request_url=url,
+            #     preload_content=False,
+            #     decode_content=False
+            # )
 
-                try:
-                    skip_host = "Host" in request.headers
-                    low_conn.putrequest(
-                        request.method,
-                        url,
-                        skip_accept_encoding=True,
-                        skip_host=skip_host,
-                    )
+            # Original code:
 
-                    for header, value in request.headers.items():
-                        low_conn.putheader(header, value)
+            # if not chunked:
+            #     resp = conn.urlopen(
+            #         method=request.method,
+            #         url=url,
+            #         body=request.body,
+            #         headers=request.headers,
+            #         redirect=False,
+            #         assert_same_host=False,
+            #         preload_content=False,
+            #         decode_content=False,
+            #         retries=self.max_retries,
+            #         timeout=timeout,
+            #     )
 
-                    low_conn.endheaders()
+            # # Send the request.
+            # else:
+            #     if hasattr(conn, "proxy_pool"):
+            #         conn = conn.proxy_pool
 
-                    for i in request.body:
-                        low_conn.send(hex(len(i))[2:].encode("utf-8"))
-                        low_conn.send(b"\r\n")
-                        low_conn.send(i)
-                        low_conn.send(b"\r\n")
-                    low_conn.send(b"0\r\n\r\n")
+            #     low_conn = conn._get_conn(timeout=DEFAULT_POOL_TIMEOUT)
 
-                    # Receive the response from the server
-                    r = low_conn.getresponse()
+            #     try:
+            #         skip_host = "Host" in request.headers
+            #         low_conn.putrequest(
+            #             request.method,
+            #             url,
+            #             skip_accept_encoding=True,
+            #             skip_host=skip_host,
+            #         )
 
-                    resp = HTTPResponse.from_httplib(
-                        r,
-                        pool=conn,
-                        connection=low_conn,
-                        preload_content=False,
-                        decode_content=False,
-                    )
-                except Exception:
-                    # If we hit any problems here, clean up the connection.
-                    # Then, raise so that we can handle the actual exception.
-                    low_conn.close()
-                    raise
+            #         for header, value in request.headers.items():
+            #             low_conn.putheader(header, value)
+
+            #         low_conn.endheaders()
+
+            #         for i in request.body:
+            #             low_conn.send(hex(len(i))[2:].encode("utf-8"))
+            #             low_conn.send(b"\r\n")
+            #             low_conn.send(i)
+            #             low_conn.send(b"\r\n")
+            #         low_conn.send(b"0\r\n\r\n")
+
+            #         # Receive the response from the server
+            #         r = low_conn.getresponse()
+
+            #         resp = HTTPResponse.from_httplib(
+            #             r,
+            #             pool=conn,
+            #             connection=low_conn,
+            #             preload_content=False,
+            #             decode_content=False,
+            #         )
+            #     except Exception:
+            #         # If we hit any problems here, clean up the connection.
+            #         # Then, raise so that we can handle the actual exception.
+            #         low_conn.close()
+            #         raise
 
         except (ProtocolError, OSError) as err:
             raise ConnectionError(err, request=request)
