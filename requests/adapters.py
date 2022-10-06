@@ -495,26 +495,43 @@ class HTTPAdapter(BaseAdapter):
             timeout = TimeoutSauce(connect=timeout, read=timeout)
 
         try:
-            fetch_response = sync_fetch(
+
+            # body is: Data to send in the request body, either str, bytes, an iterable of str/bytes, or a file-like object.
+
+            fetch_response_data = sync_fetch(
                 request.method,
                 request.url,
                 # Must convert to dict because JS doesn't understand CaseInsensitiveDict
                 dict(request.headers.items()),
                 request.body
             )
-            fetch_response = fetch_response.to_py()
+            fetch_response_data = fetch_response_data.to_py()
 
-            body_bytes = io.BytesIO(fetch_response['body'])
-            resp = HTTPResponse(
-                status=fetch_response['status'],
-                reason=fetch_response['reason'],
-                version=11,
-                body=io.BufferedReader(body_bytes),
-                request_method=request.method,
-                request_url=url,
-                preload_content=False,
-                headers=CaseInsensitiveDict(**fetch_response['headers'])
-            )
+            if 'error' in fetch_response_data:
+                errorType = fetch_response_data['error']['type']
+                message = fetch_response_data['error']['message']
+                if errorType == 'NO_RECORDED_REQUEST':
+                    # Temporary hack - replace with a custom error
+                    raise EOFError(message)
+                elif errorType == 'FETCH_ERROR':
+                    raise ConnectionError('See browser inspector for reason.')
+                else:
+                    raise ConnectionError('Fetch failed for unknown reason.')
+
+            if 'completedResponse' in fetch_response_data:
+                completed_response = fetch_response_data['completedResponse']
+                body_bytes = io.BytesIO(fetch_response_data['body'])
+
+                resp = HTTPResponse(
+                    status=completed_response['status'],
+                    reason=completed_response['reason'],
+                    version=11,
+                    body=io.BufferedReader(body_bytes),
+                    request_method=request.method,
+                    request_url=url,
+                    preload_content=False,
+                    headers=CaseInsensitiveDict(**completed_response['headers'])
+                )
 
             # Alternative implementation: From a raw HTTP request:
             # data = io.BytesIO(b'HTTP/1.1 200 OK\nContent-Length: 17\nContent-Type: text/html\n\nHello this is dog')
